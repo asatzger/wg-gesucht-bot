@@ -336,7 +336,7 @@ def escape_html(s: str) -> str:
 def build_caption(details: Dict[str, Optional[str]]) -> str:
     parts: List[str] = []
     if details.get("title"):
-        parts.append(f"<b>{escape_html(details['title'])}</b>")
+        parts.append(f"{escape_html(details['title'])}")
     if details.get("price") or details.get("size"):
         dims = []
         if details.get("price"):
@@ -344,26 +344,9 @@ def build_caption(details: Dict[str, Optional[str]]) -> str:
         if details.get("size"):
             dims.append(f"{escape_html(details['size'])} m²")
         parts.append(" | ".join(dims))
-    if details.get("address"):
-        parts.append(f"Adresse: {escape_html(str(details['address']))}")
-    if details.get("available_from"):
-        parts.append(f"Frei ab: {escape_html(str(details['available_from']))}")
-    if details.get("online_since"):
-        parts.append(f"Online: {escape_html(str(details['online_since']))}")
-    parts.append(f"<a href='{escape_html(details['url'])}'>Zur Anzeige</a>")
-
-    # Append description sections; Telegram will collapse long messages automatically
-    sections: Dict[str, str] = details.get("sections") or {}
-    order = ["Zimmer", "Lage", "WG-Leben", "Sonstiges"]
-    def trim(s: str, max_len: int = 2000) -> str:
-        return s if len(s) <= max_len else (s[:max_len] + " …")
-    for key in order:
-        val = sections.get(key)
-        if not val:
-            continue
-        parts.append("")
-        parts.append(f"<b>{key}</b>")
-        parts.append(escape_html(trim(val)))
+    url_val = details.get("url") or ""
+    if url_val:
+        parts.append(f"Zur Anzeige ({escape_html(url_val)})")
     return "\n".join(parts)
 
 
