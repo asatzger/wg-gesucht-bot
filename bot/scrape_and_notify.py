@@ -28,6 +28,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 WG_URL = os.environ.get("WG_URL", WG_URL_DEFAULT)
 
 REQUEST_TIMEOUT = 20
+DEBUG_DUMP = os.environ.get("DEBUG_DUMP_HTML", "0") == "1"
 
 
 def read_file_text(path: str) -> str:
@@ -69,26 +70,66 @@ def http_get(url: str) -> str:
 
 
 def extract_listing_ids_and_links(html_text: str) -> List[Tuple[str, str]]:
-    soup = BeautifulSoup(html_text, "html.parser")
-    anchors = soup.find_all("a", href=True)
+    """Extract listing IDs and links using multiple strategies (robust to site changes)."""
     results: List[Tuple[str, str]] = []
     seen: Set[str] = set()
-    for a in anchors:
-        href = a.get("href", "")
-        m = re.search(r"/(\d+)\.html", href)
-        if m:
-            listing_id = m.group(1)
-            if listing_id in seen:
+
+    # 1) Regex over raw HTML for absolute and relative links like /1234567.html
+    # Prefer IDs with at least 6 digits to avoid false positives
+    for m in re.finditer(r"https?://www\\.wg-gesucht\\.de/(\\d{6,})\\.html", html_text):
+        listing_id = m.group(1)
+        if listing_id in seen:
+            continue
+        seen.add(listing_id)
+        results.append((listing_id, f"https://www.wg-gesucht.de/{listing_id}.html"))
+
+    for m in re.finditer(r"/(\\d{6,})\\.html", html_text):
+        listing_id = m.group(1)
+        if listing_id in seen:
+            continue
+        seen.add(listing_id)
+        results.append((listing_id, f"https://www.wg-gesucht.de/{listing_id}.html"))
+
+    # 2) Parse DOM and check href/data-href attributes too (if present)
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+        # anchors
+        for a in soup.find_all("a"):
+            href = a.get("href") or a.get("data-href")
+            if not href:
                 continue
-            seen.add(listing_id)
-            link = href
-            if link.startswith("/"):
-                link = f"https://www.wg-gesucht.de{link}"
-            elif link.startswith("http"):
-                pass
-            else:
-                link = f"https://www.wg-gesucht.de/{link}"
-            results.append((listing_id, link))
+            mm = re.search(r"/(\\d{5,})\\.html", href) or re.search(r"https?://www\\.wg-gesucht\\.de/(\\d{5,})\\.html", href)
+            if mm:
+                listing_id = mm.group(1)
+                if listing_id in seen:
+                    continue
+                seen.add(listing_id)
+                link = href if href.startswith("http") else f"https://www.wg-gesucht.de/{listing_id}.html"
+                results.append((listing_id, link))
+
+        # elements carrying listing IDs in attributes, e.g. data-id="7864981" or data-ad_id="7864981"
+        for el in soup.find_all(attrs={"data-id": True}):
+            listing_id = str(el.get("data-id", "")).strip()
+            if re.fullmatch(r"\d{5,}", listing_id) and listing_id not in seen:
+                seen.add(listing_id)
+                results.append((listing_id, f"https://www.wg-gesucht.de/{listing_id}.html"))
+        for el in soup.find_all(attrs={"data-ad_id": True}):
+            listing_id = str(el.get("data-ad_id", "")).strip()
+            if re.fullmatch(r"\d{5,}", listing_id) and listing_id not in seen:
+                seen.add(listing_id)
+                results.append((listing_id, f"https://www.wg-gesucht.de/{listing_id}.html"))
+
+        # IDs embedded in element id attributes like id="liste-details-ad-684312"
+        for el in soup.find_all(id=True):
+            mm = re.search(r"liste-details-ad-(\d{5,})", el.get("id", ""))
+            if mm:
+                listing_id = mm.group(1)
+                if listing_id not in seen:
+                    seen.add(listing_id)
+                    results.append((listing_id, f"https://www.wg-gesucht.de/{listing_id}.html"))
+    except Exception:
+        pass
+
     return results
 
 
@@ -182,6 +223,14 @@ def run(html_file: Optional[str] = None) -> int:
 
     pairs = extract_listing_ids_and_links(text)
     print(f"Found {len(pairs)} listing links on page")
+    if len(pairs) == 0 and DEBUG_DUMP:
+        try:
+            ensure_dir("data")
+            with open("data/last_search.html", "w", encoding="utf-8") as f:
+                f.write(text)
+            print("DEBUG: wrote fetched HTML to data/last_search.html")
+        except Exception:
+            pass
 
     new_pairs = [(lid, url) for lid, url in pairs if lid not in seen_ids]
     if not new_pairs:

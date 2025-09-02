@@ -1,6 +1,8 @@
 name: scrape-wg-tuebingen
 
 on:
+  push:
+    branches: [ "main" ]
   schedule:
     - cron: "0 * * * *"  # every hour
   workflow_dispatch: {}
