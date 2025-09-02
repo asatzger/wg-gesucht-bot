@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.local
+.DS_Store
+.data/
+data/
+logs/
+*.log
+# State file for seen listings
+seen_listings.json
+# Python build artifacts
+dist/
+build/
+*.egg-info/

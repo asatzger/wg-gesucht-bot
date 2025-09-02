@@ -1,0 +1,48 @@
+name: scrape-wg-tuebingen
+
+on:
+  schedule:
+    - cron: "0 * * * *"  # every hour
+  workflow_dispatch: {}
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore state cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: wg-seen-cache-${{ github.run_id }}
+          restore-keys: |
+            wg-seen-cache-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WG_URL: "https://www.wg-gesucht.de/wg-zimmer-in-Tuebingen.127.0.1.0.html?offer_filter=1&city_id=127&sort_order=0&noDeact=1&categories%5B%5D=0&rMax=430"
+          STATE_PATH: data/seen_listings.json
+        run: |
+          python bot/scrape_and_notify.py
+
+      - name: Save state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: wg-seen-cache-${{ github.run_id }}
