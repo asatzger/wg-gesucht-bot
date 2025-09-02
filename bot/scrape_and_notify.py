@@ -133,16 +133,79 @@ def extract_listing_ids_and_links(html_text: str) -> List[Tuple[str, str]]:
     return results
 
 
+# Old generic text parsing kept for size fallback only
+
 def extract_text_patterns(text: str) -> Tuple[Optional[str], Optional[str]]:
     price = None
     size = None
-    mp = re.search(r"(\d{2,4})\s*€", text.replace("\n", " "))
+    normalized = text.replace("\n", " ")
+    # Avoid matching fractional parts like 29,90€ (which would yield 90). Ensure not preceded by digit or comma.
+    mp = re.search(r"(?<![\d,])(\d{2,4})\s*€", normalized)
     if mp:
         price = mp.group(1)
-    ms = re.search(r"(\d{1,3})\s*m²", text.replace("\n", " "))
+    ms = re.search(r"(\d{1,3})\s*m²", normalized)
     if ms:
         size = ms.group(1)
     return price, size
+
+
+def parse_price_value(text: str) -> Optional[str]:
+    s = text.replace("\xa0", " ")
+    m = re.search(r"(\d{1,4})(?:[.,]\d{1,2})?\s*€", s)
+    return m.group(1) if m else None
+
+
+def extract_price_from_soup(soup: BeautifulSoup) -> Optional[str]:
+    # Prefer structured dt/dd labels
+    price_labels = [
+        "miete",
+        "gesamtmiete",
+        "warmmiete",
+        "kaltmiete",
+        "miete pro monat",
+        "miete/monat",
+        "miete monatlich",
+    ]
+    for dt in soup.find_all("dt"):
+        dt_text = re.sub(r"\s+", " ", dt.get_text(" ", strip=True)).casefold()
+        if any(lbl in dt_text for lbl in price_labels):
+            dd = dt.find_next_sibling("dd")
+            if dd:
+                val = parse_price_value(dd.get_text(" ", strip=True))
+                if val:
+                    return val
+    # Fallback: search any element near a label
+    for el in soup.find_all(text=re.compile("€")):
+        txt = str(el)
+        price = parse_price_value(txt)
+        if price:
+            # ensure there's a nearby label up the tree
+            parent_chain = []
+            p = el.parent
+            hop = 0
+            while p is not None and hop < 3:
+                parent_chain.append(p)
+                p = p.parent
+                hop += 1
+            chain_text = " ".join(pc.get_text(" ", strip=True).casefold() for pc in parent_chain)
+            if any(lbl in chain_text for lbl in price_labels):
+                return price
+    return None
+
+
+def extract_size_from_soup(soup: BeautifulSoup) -> Optional[str]:
+    size_labels = ["größe", "zimmergröße", "fläche", "wohnfläche", "m²"]
+    for dt in soup.find_all("dt"):
+        dt_text = re.sub(r"\s+", " ", dt.get_text(" ", strip=True)).casefold()
+        if any(lbl in dt_text for lbl in size_labels):
+            dd = dt.find_next_sibling("dd")
+            if dd:
+                m = re.search(r"(\d{1,3})\s*m²", dd.get_text(" ", strip=True))
+                if m:
+                    return m.group(1)
+    # Fallback in page text
+    m2 = re.search(r"(\d{1,3})\s*m²", soup.get_text(" ", strip=True))
+    return m2.group(1) if m2 else None
 
 
 def fetch_listing_details(url: str) -> Dict[str, Optional[str]]:
@@ -158,19 +221,112 @@ def fetch_listing_details(url: str) -> Dict[str, Optional[str]]:
     if not title and soup.title:
         title = soup.title.get_text(strip=True)
 
-    # Try to find price/size in page text
-    full_text = soup.get_text(" ", strip=True)
-    price, size = extract_text_patterns(full_text)
+    # Extract price/size using structured methods
+    price = extract_price_from_soup(soup)
+    size = extract_size_from_soup(soup)
 
     # Try to find address/location heuristically
     address = None
-    # WG-Gesucht pages often have meta tags
     meta_desc = soup.find("meta", attrs={"name": "description"})
     if meta_desc and meta_desc.get("content"):
         address = meta_desc.get("content")
 
+    # Additional fields and sections
+    def clean_text(s: Optional[str]) -> str:
+        return re.sub(r"\s+", " ", s or "").strip()
+
+    def extract_by_dt_dd(label_variants: List[str]) -> Optional[str]:
+        labels_cf = [lv.casefold() for lv in label_variants]
+        for dt in soup.find_all("dt"):
+            dt_text = clean_text(dt.get_text(" ", strip=True)).casefold()
+            if any(lv in dt_text for lv in labels_cf):
+                dd = dt.find_next_sibling("dd")
+                if dd:
+                    return clean_text(dd.get_text(" ", strip=True))
+        return None
+
+    def extract_by_label_following(label_variants: List[str]) -> Optional[str]:
+        labels_cf = [lv.casefold() for lv in label_variants]
+        for el in soup.find_all(True):
+            text_here = clean_text(el.get_text(" ", strip=True)).casefold()
+            if any(text_here.startswith(lv) or text_here == lv for lv in labels_cf):
+                sib = el.find_next_sibling()
+                if sib:
+                    val = clean_text(sib.get_text(" ", strip=True))
+                    if val:
+                        return val
+                parent = el.parent
+                if parent is not None:
+                    sib2 = parent.find_next_sibling()
+                    if sib2:
+                        val2 = clean_text(sib2.get_text(" ", strip=True))
+                        if val2:
+                            return val2
+        return None
+
+    if address and re.search(r"\b(Zimmer|Lage|WG-Leben|Sonstiges)\b", address):
+        address = None
+    if address and len(address) > 200:
+        address = address[:200] + " …"
+
+    available_from = extract_by_dt_dd(["frei ab", "Einzugsdatum", "Bezug ab"]) or extract_by_label_following([
+        "frei ab", "Einzugsdatum", "Bezug ab"
+    ])
+    online_since = extract_by_dt_dd(["Online", "Online seit"]) or extract_by_label_following([
+        "Online", "Online seit"
+    ])
+
+    # Description sections
+    section_titles = ["Zimmer", "Lage", "WG-Leben", "Sonstiges"]
+    titles_cf = [t.casefold() for t in section_titles]
+
+    def is_heading(tag) -> bool:
+        return tag.name in ("h1", "h2", "h3", "h4", "h5", "h6")
+
+    def extract_sections() -> Dict[str, str]:
+        sections: Dict[str, str] = {}
+        current_title: Optional[str] = None
+        collected: List[str] = []
+
+        def flush():
+            nonlocal current_title, collected
+            if current_title and collected:
+                text = clean_text("\n".join(collected))
+                if text:
+                    sections[current_title] = text
+            current_title = None
+            collected = []
+
+        for node in soup.find_all(True):
+            if is_heading(node):
+                heading_text = clean_text(node.get_text(" ", strip=True))
+                if heading_text.casefold() in titles_cf:
+                    flush()
+                    current_title = section_titles[titles_cf.index(heading_text.casefold())]
+                    collected = []
+                    continue
+            if current_title:
+                if node.name in ("p", "ul", "ol", "li", "div"):
+                    txt = clean_text(node.get_text(" ", strip=True))
+                    if txt:
+                        collected.append(txt)
+        flush()
+        return sections
+
+    sections = extract_sections()
+
     # No image handling (text-only messages)
-    return {"title": title, "price": price, "size": size, "image": None, "address": address, "url": url}
+    return {
+        "title": title,
+        "price": price,
+        "size": size,
+        "image": None,
+        "address": address,
+        "available_from": available_from,
+        "online_since": online_since,
+        "sections": sections,
+        "url": url,
+    }
 
 
 def escape_html(s: str) -> str:
@@ -189,8 +345,25 @@ def build_caption(details: Dict[str, Optional[str]]) -> str:
             dims.append(f"{escape_html(details['size'])} m²")
         parts.append(" | ".join(dims))
     if details.get("address"):
-        parts.append(escape_html(details["address"]))
+        parts.append(f"Adresse: {escape_html(str(details['address']))}")
+    if details.get("available_from"):
+        parts.append(f"Frei ab: {escape_html(str(details['available_from']))}")
+    if details.get("online_since"):
+        parts.append(f"Online: {escape_html(str(details['online_since']))}")
     parts.append(f"<a href='{escape_html(details['url'])}'>Zur Anzeige</a>")
+
+    # Append description sections; Telegram will collapse long messages automatically
+    sections: Dict[str, str] = details.get("sections") or {}
+    order = ["Zimmer", "Lage", "WG-Leben", "Sonstiges"]
+    def trim(s: str, max_len: int = 2000) -> str:
+        return s if len(s) <= max_len else (s[:max_len] + " …")
+    for key in order:
+        val = sections.get(key)
+        if not val:
+            continue
+        parts.append("")
+        parts.append(f"<b>{key}</b>")
+        parts.append(escape_html(trim(val)))
     return "\n".join(parts)
 
 
@@ -203,7 +376,14 @@ def tg_send_message(token: str, chat_id: str, text: str, disable_web_page_previe
         "disable_web_page_preview": disable_web_page_preview,
     }
     r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        try:
+            print(f"Telegram error response: {r.text}")
+        except Exception:
+            pass
+        raise
 
 
 
